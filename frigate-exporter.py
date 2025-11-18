@@ -19,15 +19,36 @@ from datetime import datetime, timedelta
 import signal
 import argparse
 import logging
+import logging.handlers
 import configparser
 
 # 设置日志
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# 创建控制台处理器
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+console_handler.setFormatter(console_formatter)
+
+# 创建文件处理器，用于日志轮转
+script_name = os.path.basename(__file__).replace('.py', '')
+log_file = f'/var/log/{script_name}.log'
+try:
+    file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=30)
+except IOError:
+    # 如果无法创建/var/log目录下的文件，则在当前目录创建日志文件
+    log_file = f'{script_name}.log'
+    file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=30)
+
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+file_handler.setFormatter(file_formatter)
+
+# 添加处理器到logger
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 # 导入pytz用于时区处理
 import pytz
@@ -540,7 +561,6 @@ def main():
     logger.info(f"开始执行 Frigate 导出任务: {now_china.strftime('%Y-%m-%d %H:%M:%S')} (中国时区)")
     logger.info(f"Frigate API地址: {FRIGATE_API_URL}")
     logger.info(f"导出文件保存路径: {DEST_PATH}")
-    logger.info(f"导出 {EXPORT_DAYS_AGO} 天前的录像")
     
     # 获取摄像头列表
     if args.cameras is None:
