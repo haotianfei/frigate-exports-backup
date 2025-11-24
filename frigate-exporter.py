@@ -60,7 +60,7 @@ DEST_PATH = ""
 EXPORT_RETENTION_DAYS = 30
 EXPORT_DAYS_AGO = 1
 TIMEZONE = "Asia/Shanghai"
-CHINA_TZ = pytz.timezone('Asia/Shanghai')  # 默认时区
+TIMEZONE_OBJ = pytz.timezone(TIMEZONE)  # 初始化为默认时区
 
 def load_config(config_file='config.ini'):
     """
@@ -69,7 +69,7 @@ def load_config(config_file='config.ini'):
     Args:
         config_file: 配置文件路径
     """
-    global FRIGATE_API_URL, SOURCE_PATH, DEST_PATH, EXPORT_RETENTION_DAYS, EXPORT_DAYS_AGO, TIMEZONE, CHINA_TZ
+    global FRIGATE_API_URL, SOURCE_PATH, DEST_PATH, EXPORT_RETENTION_DAYS, EXPORT_DAYS_AGO, TIMEZONE, TIMEZONE_OBJ
     
     config = configparser.ConfigParser()
     if not config.read(config_file, encoding='utf-8'):
@@ -90,19 +90,86 @@ def load_config(config_file='config.ini'):
         
         # 设置时区
         try:
-            CHINA_TZ = pytz.timezone(TIMEZONE)
+            TIMEZONE_OBJ = pytz.timezone(TIMEZONE)
             logger.info(f"已设置时区为: {TIMEZONE}")
         except pytz.exceptions.UnknownTimeZoneError:
             logger.warning(f"未知的时区: {TIMEZONE}, 使用默认时区 UTC")
-            CHINA_TZ = pytz.UTC
+            TIMEZONE_OBJ = pytz.UTC
         
         logger.info(f"已从配置文件 {config_file} 加载配置")
     except Exception as e:
         logger.error(f"读取配置文件 {config_file} 时出错: {e}")
         sys.exit(1)
 
-# 加载配置
-load_config()
+def main():
+    """
+    主函数
+    """
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='Frigate录像导出和备份工具')
+    parser.add_argument('--cameras', '-c', nargs='+', help='指定要导出的摄像头列表（默认导出所有摄像头）')
+    parser.add_argument('--date', help='指定导出日期，格式为 YYYY-MM-DD（默认为配置的天数前）')
+    parser.add_argument('--start-hour', type=int, default=0, help='导出开始时间（小时，0-23，默认为0）')
+    parser.add_argument('--end-hour', type=int, default=23, help='导出结束时间（小时，0-23，默认为23）')
+    parser.add_argument('--config', help='指定配置文件路径')
+    args = parser.parse_args()
+    
+    # 如果指定了配置文件，则加载指定配置文件，否则加载默认配置文件
+    if args.config:
+        load_config(args.config)
+    else:
+        load_config()
+    
+    # 检查必要配置是否存在
+    if not all([FRIGATE_API_URL, SOURCE_PATH, DEST_PATH, EXPORT_RETENTION_DAYS]):
+        logger.error("配置不完整，请检查配置文件")
+        sys.exit(1)
+    
+    now_china = datetime.now(TIMEZONE_OBJ)
+    logger.info(f"开始执行 Frigate 导出任务: {now_china.strftime('%Y-%m-%d %H:%M:%S')} (中国时区)")
+    logger.info(f"Frigate API地址: {FRIGATE_API_URL}")
+    logger.info(f"导出文件保存路径: {DEST_PATH}")
+    
+    # 获取摄像头列表
+    if args.cameras is None:
+        cameras = get_cameras()
+        logger.info(f"发现摄像头: {', '.join(cameras)}")
+    else:
+        cameras = args.cameras
+        logger.info(f"指定摄像头: {', '.join(cameras)}")
+    
+    # 处理时间范围参数
+    time_range = None
+    if args.start_hour != 0 or args.end_hour != 23:
+        time_range = (args.start_hour, args.end_hour)
+    
+    # 步骤1: 导出指定日期和时间范围的录像
+    exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
+    exported_camera_names = [item["camera"] for item in exported_cameras]
+    
+    if should_exit:
+        return
+    
+    # 步骤2: 等待导出完成
+    if exported_cameras:
+        logger.info("等待导出完成...")
+        check_export_status(exported_camera_names, date=args.date)
+    
+    if should_exit:
+        return
+    
+    # 步骤3: 检查并移动已完成的导出文件
+    logger.info("检查并移动导出文件...")
+    check_and_move_exported_files(exported_camera_names, date=args.date)
+    
+    if should_exit:
+        return
+    
+    # 步骤4: 清理超过指定天数的旧导出文件
+    logger.info("清理旧导出文件...")
+    clean_old_exports()
+    
+    logger.info("Frigate 导出任务完成")
 
 # 全局变量用于优雅退出
 should_exit = False
@@ -146,13 +213,13 @@ def export_previous_day_recordings(cameras=None, date=None, time_range=None):
         time_range: 时间范围元组 (start_hour, end_hour)，如果为None则使用全天(0, 23)
     """
     # 获取中国时区的当前时间
-    now_china = datetime.now(CHINA_TZ)
+    now_china = datetime.now(TIMEZONE_OBJ)
     
     # 处理日期参数
     if date:
         try:
             target_date = datetime.strptime(date, '%Y-%m-%d')
-            target_date = CHINA_TZ.localize(target_date)
+            target_date = TIMEZONE_OBJ.localize(target_date)
         except ValueError:
             logger.error(f"日期格式错误: {date}，应为 YYYY-MM-DD 格式")
             return []
@@ -170,9 +237,9 @@ def export_previous_day_recordings(cameras=None, date=None, time_range=None):
         # 默认使用全天
         start_hour, end_hour = 0, 23
     
-    # 计算开始和结束时间戳（中国时区）
-    start_of_target = CHINA_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, start_hour, 0, 0))
-    end_of_target = CHINA_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, end_hour, 59, 59))
+    # 计算开始和结束时间戳
+    start_of_target = TIMEZONE_OBJ.localize(datetime(target_date.year, target_date.month, target_date.day, start_hour, 0, 0))
+    end_of_target = TIMEZONE_OBJ.localize(datetime(target_date.year, target_date.month, target_date.day, end_hour, 59, 59))
     
     start_timestamp = int(start_of_target.timestamp())
     end_timestamp = int(end_of_target.timestamp())
@@ -304,7 +371,7 @@ def check_export_status(cameras, max_wait_time=7200, date=None):
             return False
     else:
         # 使用配置的天数前的日期
-        target_date_str = (datetime.now(CHINA_TZ) - timedelta(days=EXPORT_DAYS_AGO)).strftime('%Y-%m-%d')
+        target_date_str = (datetime.now(TIMEZONE_OBJ) - timedelta(days=EXPORT_DAYS_AGO)).strftime('%Y-%m-%d')
     
     # 记录需要等待完成的摄像头
     pending_cameras = set(cameras)
@@ -433,7 +500,7 @@ def check_and_move_exported_files(cameras, date=None):
                 return
         else:
             # 使用配置的天数前的日期
-            target_date_str = (datetime.now(CHINA_TZ) - timedelta(days=EXPORT_DAYS_AGO)).strftime('%Y-%m-%d')
+            target_date_str = (datetime.now(TIMEZONE_OBJ) - timedelta(days=EXPORT_DAYS_AGO)).strftime('%Y-%m-%d')
         
         # 只处理指定摄像头和日期的导出任务
         target_exports = [e for e in exports 
@@ -497,7 +564,7 @@ def clean_old_exports():
     """
     try:
         # 获取中国时区的当前时间
-        now_china = datetime.now(CHINA_TZ)
+        now_china = datetime.now(TIMEZONE_OBJ)
         cutoff_date = now_china - timedelta(days=EXPORT_RETENTION_DAYS)
         logger.info(f"清理 {cutoff_date.strftime('%Y-%m-%d')} 之前的历史文件")
         
@@ -516,9 +583,9 @@ def clean_old_exports():
                 file_modified = datetime.fromtimestamp(os.path.getmtime(file_path))
                 # 确保比较的是相同类型的datetime对象
                 if file_modified.tzinfo is None:
-                    file_modified = CHINA_TZ.localize(file_modified)
+                    file_modified = TIMEZONE_OBJ.localize(file_modified)
                 else:
-                    file_modified = file_modified.astimezone(CHINA_TZ)
+                    file_modified = file_modified.astimezone(TIMEZONE_OBJ)
                     
                 if file_modified < cutoff_date:
                     try:
@@ -533,75 +600,6 @@ def clean_old_exports():
     except Exception as e:
         logger.error(f"清理旧导出文件时出错: {e}")
 
-
-def main():
-    """
-    主函数
-    """
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description='Frigate录像导出和备份工具')
-    parser.add_argument('--cameras', '-c', nargs='+', help='指定要导出的摄像头列表（默认导出所有摄像头）')
-    parser.add_argument('--date', help='指定导出日期，格式为 YYYY-MM-DD（默认为配置的天数前）')
-    parser.add_argument('--start-hour', type=int, default=0, help='导出开始时间（小时，0-23，默认为0）')
-    parser.add_argument('--end-hour', type=int, default=23, help='导出结束时间（小时，0-23，默认为23）')
-    parser.add_argument('--config', help='指定配置文件路径')
-    args = parser.parse_args()
-    
-    # 如果指定了配置文件，则重新加载配置
-    if args.config:
-        load_config(args.config)
-    
-    # 检查必要配置是否存在
-    if not all([FRIGATE_API_URL, SOURCE_PATH, DEST_PATH, EXPORT_RETENTION_DAYS]):
-        logger.error("配置不完整，请检查配置文件")
-        sys.exit(1)
-    
-    # 设置中国时区
-    now_china = datetime.now(CHINA_TZ)
-    logger.info(f"开始执行 Frigate 导出任务: {now_china.strftime('%Y-%m-%d %H:%M:%S')} (中国时区)")
-    logger.info(f"Frigate API地址: {FRIGATE_API_URL}")
-    logger.info(f"导出文件保存路径: {DEST_PATH}")
-    
-    # 获取摄像头列表
-    if args.cameras is None:
-        cameras = get_cameras()
-        logger.info(f"发现摄像头: {', '.join(cameras)}")
-    else:
-        cameras = args.cameras
-        logger.info(f"指定摄像头: {', '.join(cameras)}")
-    
-    # 处理时间范围参数
-    time_range = None
-    if args.start_hour != 0 or args.end_hour != 23:
-        time_range = (args.start_hour, args.end_hour)
-    
-    # 步骤1: 导出指定日期和时间范围的录像
-    exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
-    exported_camera_names = [item["camera"] for item in exported_cameras]
-    
-    if should_exit:
-        return
-    
-    # 步骤2: 等待导出完成
-    if exported_cameras:
-        logger.info("等待导出完成...")
-        check_export_status(exported_camera_names, date=args.date)
-    
-    if should_exit:
-        return
-    
-    # 步骤3: 检查并移动已完成的导出文件
-    logger.info("检查并移动导出文件...")
-    check_and_move_exported_files(exported_camera_names, date=args.date)
-    
-    if should_exit:
-        return
-    
-    # 步骤4: 清理超过指定天数的旧导出文件
-    logger.info("清理旧导出文件...")
-    clean_old_exports()
-    
-    logger.info("Frigate 导出任务完成")
-
 if __name__ == "__main__":
     main()
+
