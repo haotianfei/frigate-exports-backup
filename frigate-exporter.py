@@ -110,7 +110,7 @@ def main():
     parser.add_argument('--cameras', '-c', nargs='+', help='指定要导出的摄像头列表（默认导出所有摄像头）')
     parser.add_argument('--date', help='指定导出日期，格式为 YYYY-MM-DD（默认为配置的天数前）')
     parser.add_argument('--start-hour', type=int, default=0, help='导出开始时间（小时，0-23，默认为0）')
-    parser.add_argument('--end-hour', type=int, default=23, help='导出结束时间（小时，0-23，默认为23）')
+    parser.add_argument('--end-hour', type=int, default=24, help='导出结束时间（小时，0-24，默认为24）')
     parser.add_argument('--split-interval', type=int, help='按指定小时分割录像，例如4表示每4小时一个文件')
     parser.add_argument('--config', help='指定配置文件路径')
     args = parser.parse_args()
@@ -146,7 +146,7 @@ def main():
             sys.exit(1)
         all_exported_cameras = []
         for start_hour in range(0, 24, args.split_interval):
-            end_hour = min(start_hour + args.split_interval, 24)  # 修正：不再减1，允许24点
+            end_hour = min(start_hour + args.split_interval, 24)
             if start_hour >= end_hour:
                 break
             logger.info(f"开始导出时间段: {start_hour:02d}:00 - {end_hour:02d}:00")
@@ -159,7 +159,7 @@ def main():
         if args.start_hour != 0 or args.end_hour != 23:
             time_range = (args.start_hour, args.end_hour)
         exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
-
+    
     exported_camera_names = [item["camera"] for item in exported_cameras]
     
     if should_exit:
