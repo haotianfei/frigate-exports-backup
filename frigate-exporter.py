@@ -112,8 +112,17 @@ def main():
     parser.add_argument('--start-hour', type=int, default=0, help='导出开始时间（小时，0-23，默认为0）')
     parser.add_argument('--end-hour', type=int, default=24, help='导出结束时间（小时，0-24，默认为24）')
     parser.add_argument('--split-interval', type=int, help='按指定小时分割录像，例如4表示每4小时一个文件')
+    parser.add_argument('--sequential-split', action='store_true', help='对分割的时间段顺序执行完整导出流程（导出→等待→移动），避免同时占用过多空间')
     parser.add_argument('--config', help='指定配置文件路径')
     args = parser.parse_args()
+
+    # 添加参数范围验证
+    if not (0 <= args.start_hour <= 23):
+        parser.error("start-hour必须在0-23之间")
+    if not (0 <= args.end_hour <= 24):
+        parser.error("end-hour必须在0-24之间")
+    if args.start_hour > args.end_hour:
+        parser.error("start-hour必须小于等于end-hour")
 
     # 如果指定了配置文件，则加载指定配置文件，否则加载默认配置文件
     if args.config:
@@ -141,26 +150,74 @@ def main():
 
     # 处理时间范围参数
     if args.split_interval is not None:
-        if args.start_hour != 0 or args.end_hour != 23:
+        if args.start_hour != 0 or args.end_hour != 24:
             logger.error("不能同时指定--split-interval和--start-hour/--end-hour")
             sys.exit(1)
+        
         all_exported_cameras = []
-        for start_hour in range(0, 24, args.split_interval):
-            end_hour = min(start_hour + args.split_interval, 24)
-            if start_hour >= end_hour:
-                break
-            logger.info(f"开始导出时间段: {start_hour:02d}:00 - {end_hour:02d}:00")
-            time_range = (start_hour, end_hour)
-            exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
-            all_exported_cameras.extend(exported_cameras)
-        exported_cameras = all_exported_cameras
+        # 检查是否启用顺序执行模式
+        if args.sequential_split:
+            logger.info("启用顺序执行模式，将逐个处理每个时间段的完整导出流程")
+            
+            for start_hour in range(0, 24, args.split_interval):
+                end_hour = min(start_hour + args.split_interval, 24)
+                if start_hour >= end_hour:
+                    break
+                
+                logger.info(f"开始处理时间段: {start_hour:02d}:00 - {end_hour:02d}:00")
+                time_range = (start_hour, end_hour)
+                
+                # 1. 导出当前时间段
+                exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
+                
+                if not exported_cameras:
+                    logger.warning(f"时间段 {start_hour:02d}:00-{end_hour:02d}:00 无录像可导出")
+                    continue
+                
+                exported_camera_names = [item["camera"] for item in exported_cameras]
+                start_timestamps = [item["date"] for item in exported_cameras]
+                
+                if should_exit:
+                    return
+                
+                # 2. 等待当前时间段导出完成
+                logger.info(f"等待时间段 {start_hour:02d}:00-{end_hour:02d}:00 的导出完成...")
+                check_export_status(exported_camera_names, start_timestamps, date=args.date)
+                
+                if should_exit:
+                    return
+                
+                # 3. 移动当前时间段的文件
+                logger.info(f"检查并移动时间段 {start_hour:02d}:00-{end_hour:02d}:00 的导出文件...")
+                check_and_move_exported_files(exported_camera_names, start_timestamps, date=args.date)
+                
+                if should_exit:
+                    return
+                
+                all_exported_cameras.extend(exported_cameras)
+                
+                logger.info(f"已完成时间段 {start_hour:02d}:00-{end_hour:02d}:00 的完整导出流程")
+                
+            exported_cameras = all_exported_cameras
+        else:
+            # 原有批量处理模式
+            for start_hour in range(0, 24, args.split_interval):
+                end_hour = min(start_hour + args.split_interval, 24)
+                if start_hour >= end_hour:
+                    break
+                logger.info(f"开始导出时间段: {start_hour:02d}:00 - {end_hour:02d}:00")
+                time_range = (start_hour, end_hour)
+                exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
+                all_exported_cameras.extend(exported_cameras)
+            exported_cameras = all_exported_cameras
     else:
         time_range = None
-        if args.start_hour != 0 or args.end_hour != 23:
+        if args.start_hour != 0 or args.end_hour != 24:
             time_range = (args.start_hour, args.end_hour)
         exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
     
     exported_camera_names = [item["camera"] for item in exported_cameras]
+    start_timestamps = [item["date"] for item in exported_cameras]
     
     if should_exit:
         return
@@ -168,14 +225,14 @@ def main():
     # 步骤2: 等待导出完成
     if exported_cameras:
         logger.info("等待导出完成...")
-        check_export_status(exported_camera_names, date=args.date)
+        check_export_status(exported_camera_names, start_timestamps, date=args.date)
     
     if should_exit:
         return
     
     # 步骤3: 检查并移动已完成的导出文件
     logger.info("检查并移动导出文件...")
-    check_and_move_exported_files(exported_camera_names, date=args.date)
+    check_and_move_exported_files(exported_camera_names, start_timestamps, date=args.date)
     
     if should_exit:
         return
@@ -225,7 +282,7 @@ def export_previous_day_recordings(cameras=None, date=None, time_range=None):
     Args:
         cameras: 指定要导出的摄像头列表，如果为None则导出所有摄像头
         date: 指定日期，格式为 YYYY-MM-DD，如果为None则使用默认天数前的日期
-        time_range: 时间范围元组 (start_hour, end_hour)，如果为None则使用全天(0, 23)
+        time_range: 时间范围元组 (start_hour, end_hour)，如果为None则使用全天(0, 24)
     """
     # 获取中国时区的当前时间
     now_china = datetime.now(TIMEZONE_OBJ)
@@ -368,7 +425,7 @@ def get_file_size(filepath):
     except:
         return "未知大小"
 
-def check_export_status(cameras, max_wait_time=7200, date=None):
+def check_export_status(cameras, start_timestamps, max_wait_time=7200, date=None):
     """
     检查特定摄像头的导出状态直到完成或超时
     
@@ -413,6 +470,7 @@ def check_export_status(cameras, max_wait_time=7200, date=None):
                 # 查找该摄像头相关的指定日期导出任务
                 camera_exports = [e for e in exports 
                                 if e.get("camera") == camera 
+                                and e.get("date") in start_timestamps
                                 and target_date_str in e.get("name", "")]
 
                 # 检查是否还有进行中的任务
@@ -452,6 +510,7 @@ def check_export_status(cameras, max_wait_time=7200, date=None):
                 else:
                     # 收集正在进行的导出任务信息用于后续显示
                     for export in in_progress_exports:
+                        task_name = export.get("name", "未知任务")
                         video_path = export.get("video_path", "未知路径")
                         # 转换为实际文件路径
                         real_path = get_real_file_path(video_path)
@@ -460,12 +519,12 @@ def check_export_status(cameras, max_wait_time=7200, date=None):
                         
                         if os.path.exists(real_path):
                             file_size = get_file_size(real_path)
-                            progress_info.append(f"{camera}: {file_size}, 已执行: {elapsed_formatted}")
+                            progress_info.append(f"{task_name}({camera}): {file_size}, 已执行: {elapsed_formatted}")
                             
                             # 更新文件大小记录
                             file_sizes[real_path] = os.path.getsize(real_path)
                         else:
-                            progress_info.append(f"{camera}: 文件不存在, 已执行: {elapsed_formatted}")
+                            progress_info.append(f"{task_name}({camera}): 文件不存在, 已执行: {elapsed_formatted}")
             
             # 显示进度信息
             if progress_info:
@@ -491,7 +550,7 @@ def check_export_status(cameras, max_wait_time=7200, date=None):
     
     return not bool(pending_cameras)
 
-def check_and_move_exported_files(cameras, date=None):
+def check_and_move_exported_files(cameras, start_timestamps, date=None):
     """
     检查已完成的导出文件并将其移动到目标目录
 
@@ -524,6 +583,7 @@ def check_and_move_exported_files(cameras, date=None):
         # 只处理指定摄像头和日期的导出任务
         target_exports = [e for e in exports 
                          if e.get("camera") in cameras 
+                         and e.get("date") in start_timestamps
                          and not e.get("in_progress", False)
                          and target_date_str in e.get("name", "")]
         
