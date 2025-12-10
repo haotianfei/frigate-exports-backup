@@ -65,12 +65,12 @@ TIMEZONE_OBJ = pytz.timezone(TIMEZONE)  # 初始化为默认时区
 def load_config(config_file='config.ini'):
     """
     从配置文件加载配置参数
-    
+
     Args:
         config_file: 配置文件路径
     """
     global FRIGATE_API_URL, SOURCE_PATH, DEST_PATH, EXPORT_RETENTION_DAYS, EXPORT_DAYS_AGO, TIMEZONE, TIMEZONE_OBJ
-    
+
     config = configparser.ConfigParser()
     if not config.read(config_file, encoding='utf-8'):
         logger.error(f"无法读取配置文件 {config_file}")
@@ -79,7 +79,7 @@ def load_config(config_file='config.ini'):
     if 'frigate' not in config:
         logger.error(f"配置文件 {config_file} 中未找到 [frigate] 配置段")
         sys.exit(1)
-    
+
     try:
         FRIGATE_API_URL = config.get('frigate', 'api_url')
         SOURCE_PATH = config.get('frigate', 'source_path')
@@ -87,7 +87,7 @@ def load_config(config_file='config.ini'):
         EXPORT_RETENTION_DAYS = config.getint('frigate', 'export_retention_days')
         EXPORT_DAYS_AGO = config.getint('frigate', 'export_days_ago', fallback=1)
         TIMEZONE = config.get('frigate', 'timezone', fallback='Asia/Shanghai')
-        
+
         # 设置时区
         try:
             TIMEZONE_OBJ = pytz.timezone(TIMEZONE)
@@ -95,7 +95,7 @@ def load_config(config_file='config.ini'):
         except pytz.exceptions.UnknownTimeZoneError:
             logger.warning(f"未知的时区: {TIMEZONE}, 使用默认时区 UTC")
             TIMEZONE_OBJ = pytz.UTC
-        
+
         logger.info(f"已从配置文件 {config_file} 加载配置")
     except Exception as e:
         logger.error(f"读取配置文件 {config_file} 时出错: {e}")
@@ -111,25 +111,26 @@ def main():
     parser.add_argument('--date', help='指定导出日期，格式为 YYYY-MM-DD（默认为配置的天数前）')
     parser.add_argument('--start-hour', type=int, default=0, help='导出开始时间（小时，0-23，默认为0）')
     parser.add_argument('--end-hour', type=int, default=23, help='导出结束时间（小时，0-23，默认为23）')
+    parser.add_argument('--split-interval', type=int, help='按指定小时分割录像，例如4表示每4小时一个文件')
     parser.add_argument('--config', help='指定配置文件路径')
     args = parser.parse_args()
-    
+
     # 如果指定了配置文件，则加载指定配置文件，否则加载默认配置文件
     if args.config:
         load_config(args.config)
     else:
         load_config()
-    
+
     # 检查必要配置是否存在
     if not all([FRIGATE_API_URL, SOURCE_PATH, DEST_PATH, EXPORT_RETENTION_DAYS]):
         logger.error("配置不完整，请检查配置文件")
         sys.exit(1)
-    
+
     now_china = datetime.now(TIMEZONE_OBJ)
     logger.info(f"开始执行 Frigate 导出任务: {now_china.strftime('%Y-%m-%d %H:%M:%S')} (中国时区)")
     logger.info(f"Frigate API地址: {FRIGATE_API_URL}")
     logger.info(f"导出文件保存路径: {DEST_PATH}")
-    
+
     # 获取摄像头列表
     if args.cameras is None:
         cameras = get_cameras()
@@ -137,14 +138,28 @@ def main():
     else:
         cameras = args.cameras
         logger.info(f"指定摄像头: {', '.join(cameras)}")
-    
+
     # 处理时间范围参数
-    time_range = None
-    if args.start_hour != 0 or args.end_hour != 23:
-        time_range = (args.start_hour, args.end_hour)
-    
-    # 步骤1: 导出指定日期和时间范围的录像
-    exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
+    if args.split_interval is not None:
+        if args.start_hour != 0 or args.end_hour != 23:
+            logger.error("不能同时指定--split-interval和--start-hour/--end-hour")
+            sys.exit(1)
+        all_exported_cameras = []
+        for start_hour in range(0, 23, args.split_interval):
+            end_hour = min(start_hour + args.split_interval - 1, 23)
+            if start_hour > end_hour:
+                break
+            logger.info(f"开始导出时间段: {start_hour:02d}:00 - {end_hour:02d}:59")
+            time_range = (start_hour, end_hour)
+            exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
+            all_exported_cameras.extend(exported_cameras)
+        exported_cameras = all_exported_cameras
+    else:
+        time_range = None
+        if args.start_hour != 0 or args.end_hour != 23:
+            time_range = (args.start_hour, args.end_hour)
+        exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
+
     exported_camera_names = [item["camera"] for item in exported_cameras]
     
     if should_exit:
@@ -230,16 +245,20 @@ def export_previous_day_recordings(cameras=None, date=None, time_range=None):
     # 处理时间范围参数
     if time_range:
         start_hour, end_hour = time_range
-        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and start_hour <= end_hour):
+        if not (0 <= start_hour <= 24 and 0 <= end_hour <= 24 and start_hour <= end_hour):
             logger.error(f"时间范围错误: {time_range}，应为有效的小时数元组 (start_hour, end_hour)")
             return []
     else:
-        # 默认使用全天
-        start_hour, end_hour = 0, 23
+        # 默认使用全天（0-24小时）
+        start_hour, end_hour = 0, 24
     
     # 计算开始和结束时间戳
     start_of_target = TIMEZONE_OBJ.localize(datetime(target_date.year, target_date.month, target_date.day, start_hour, 0, 0))
-    end_of_target = TIMEZONE_OBJ.localize(datetime(target_date.year, target_date.month, target_date.day, end_hour, 59, 59))
+    if end_hour == 24:
+        # 24点表示下一天的0点
+        end_of_target = TIMEZONE_OBJ.localize(datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)) + timedelta(days=1)
+    else:
+        end_of_target = TIMEZONE_OBJ.localize(datetime(target_date.year, target_date.month, target_date.day, end_hour, 0, 0))
     
     start_timestamp = int(start_of_target.timestamp())
     end_timestamp = int(end_of_target.timestamp())
@@ -269,7 +288,7 @@ def export_previous_day_recordings(cameras=None, date=None, time_range=None):
             
             # 根据文档，应该是POST请求到这个端点
             export_url = f"{FRIGATE_API_URL}/api/export/{camera}/start/{start_timestamp}/end/{end_timestamp}"
-            logger.info(f"正在导出摄像头 {camera} 的录像...")
+            logger.info(f"正在导出摄像头 {camera} 的录像..., export_url: {export_url}")
             
             response = requests.post(export_url, json=export_data)
             if response.status_code in [200, 201]:
@@ -475,7 +494,7 @@ def check_export_status(cameras, max_wait_time=7200, date=None):
 def check_and_move_exported_files(cameras, date=None):
     """
     检查已完成的导出文件并将其移动到目标目录
-    
+
     Args:
         cameras: 摄像头列表
         date: 指定日期，格式为 YYYY-MM-DD，如果为None则使用默认天数前的日期
@@ -485,10 +504,10 @@ def check_and_move_exported_files(cameras, date=None):
         response = requests.get(f"{FRIGATE_API_URL}/api/exports")
         response.raise_for_status()
         exports = response.json()
-        
+
         # 创建目标目录（如果不存在）
         os.makedirs(DEST_PATH, exist_ok=True)
-        
+
         moved_files = 0
         # 获取目标日期
         if date:
@@ -501,7 +520,7 @@ def check_and_move_exported_files(cameras, date=None):
         else:
             # 使用配置的天数前的日期
             target_date_str = (datetime.now(TIMEZONE_OBJ) - timedelta(days=EXPORT_DAYS_AGO)).strftime('%Y-%m-%d')
-        
+
         # 只处理指定摄像头和日期的导出任务
         target_exports = [e for e in exports 
                          if e.get("camera") in cameras 
@@ -509,37 +528,37 @@ def check_and_move_exported_files(cameras, date=None):
                          and target_date_str in e.get("name", "")]
         
         logger.info(f"找到 {len(target_exports)} 个 {target_date_str} 已完成的导出任务")
-        
+
         for export in target_exports:
             if should_exit:
                 break
-                
+
             # 获取导出文件路径
             video_path = export.get("video_path", "")
             # 转换为实际文件路径
             real_path = get_real_file_path(video_path)
-            
+
             if not video_path or not os.path.exists(real_path):
                 logger.warning(f"导出文件不存在或路径无效: {real_path}")
                 continue
-            
+
             # 显示文件信息
             file_size = get_file_size(real_path)
             camera = export.get("camera", "Unknown")
             elapsed_time = time.time() - export_start_times.get(camera, time.time())
             elapsed_formatted = format_duration(elapsed_time)
             logger.info(f"处理文件: {real_path} (大小: {file_size}, 总耗时: {elapsed_formatted})")
-            
+
             # 构造目标文件路径
             filename = os.path.basename(real_path)
             dest_file = os.path.join(DEST_PATH, filename)
-            
+
             # 移动文件到目标目录
             try:
                 shutil.move(real_path, dest_file)
                 logger.info(f"已将 {filename} 移动到 {DEST_PATH}")
                 moved_files += 1
-                
+
                 # 可选：删除Frigate中的导出记录
                 export_id = export.get("id", "")
                 if export_id:
@@ -549,12 +568,12 @@ def check_and_move_exported_files(cameras, date=None):
                             logger.info(f"已从Frigate中删除导出记录: {export_id}")
                     except Exception as e:
                         logger.error(f"删除导出记录 {export_id} 时出错: {e}")
-                
+
             except Exception as e:
                 logger.error(f"移动文件 {filename} 时出错: {e}")
-        
+
         logger.info(f"共移动了 {moved_files} 个文件")
-                
+
     except Exception as e:
         logger.error(f"检查导出文件时出错: {e}")
 
@@ -571,12 +590,12 @@ def clean_old_exports():
         if not os.path.exists(DEST_PATH):
             logger.warning(f"目标目录 {DEST_PATH} 不存在")
             return
-        
+
         cleaned_files = 0
         for filename in os.listdir(DEST_PATH):
             if should_exit:
                 break
-                
+
             file_path = os.path.join(DEST_PATH, filename)
             if os.path.isfile(file_path):
                 # 根据文件修改时间判断
@@ -586,7 +605,7 @@ def clean_old_exports():
                     file_modified = TIMEZONE_OBJ.localize(file_modified)
                 else:
                     file_modified = file_modified.astimezone(TIMEZONE_OBJ)
-                    
+
                 if file_modified < cutoff_date:
                     try:
                         os.remove(file_path)
@@ -594,12 +613,11 @@ def clean_old_exports():
                         cleaned_files += 1
                     except Exception as e:
                         logger.error(f"删除文件 {filename} 时出错: {e}")
-        
+
         logger.info(f"共清理了 {cleaned_files} 个过期文件")
-                        
+
     except Exception as e:
         logger.error(f"清理旧导出文件时出错: {e}")
 
 if __name__ == "__main__":
     main()
-
