@@ -145,11 +145,11 @@ def main():
             logger.error("不能同时指定--split-interval和--start-hour/--end-hour")
             sys.exit(1)
         all_exported_cameras = []
-        for start_hour in range(0, 23, args.split_interval):
-            end_hour = min(start_hour + args.split_interval - 1, 23)
-            if start_hour > end_hour:
+        for start_hour in range(0, 24, args.split_interval):
+            end_hour = min(start_hour + args.split_interval, 24)  # 修正：不再减1，允许24点
+            if start_hour >= end_hour:
                 break
-            logger.info(f"开始导出时间段: {start_hour:02d}:00 - {end_hour:02d}:59")
+            logger.info(f"开始导出时间段: {start_hour:02d}:00 - {end_hour:02d}:00")
             time_range = (start_hour, end_hour)
             exported_cameras = export_previous_day_recordings(cameras, args.date, time_range)
             all_exported_cameras.extend(exported_cameras)
